@@ -1,0 +1,23 @@
+# Local agent instructions
+AGENT.md
+AGENTS.md
+
+# Local tests and fixtures
+test/
+tests/
+__tests__/
+fixtures/
+*.test.*
+*.spec.*
+*_test.go
+test_*.py
+*_test.py
+
+# Local test output
+coverage/
+.nyc_output/
+
+# Local documentation
+doc/
+docs/
+assets/

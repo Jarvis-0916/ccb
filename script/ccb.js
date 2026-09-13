@@ -3,7 +3,7 @@
 // @description  Custom CDN of Bilibili (CCB)
 // @namespace    CCB
 // @license      MIT
-// @version      2.1.0
+// @version      2.2.3
 // @author       鼠鼠今天吃嘉然
 // @run-at       document-start
 // @match        https://www.bilibili.com/video/*
@@ -15,6 +15,12 @@
 // @match        https://www.bilibili.com/blackboard/*
 // @match        https://player.bilibili.com/*
 // @connect      kanda-akihito-kun.github.io
+// @connect      bilivideo.com
+// @connect      bilivideo.cn
+// @connect      acgvideo.com
+// @connect      acgvideo.cn
+// @connect      akamaized.net
+// @connect      edge.mountaintoys.cn
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,6 +31,329 @@
 ;(() => {
     const api = 'https://kanda-akihito-kun.github.io/ccb/api'
     const defaultCdnNode = '使用默认源'
+    const autoCdnNode = '自动优选（当前地区）'
+    const autoChannelName = `CCB-auto-${Math.random().toString(36).slice(2)}`
+    let autoChannel = null
+    let autoHost = ''
+    let autoObservedHost = ''
+    let autoStatus = '等待视频播放信息'
+    let autoTrack = null
+    let autoJob = null
+    let autoPage = location.href
+    let autoCompletedKey = ''
+    let autoSettingsSeen = ''
+    const autoFailed = new Set()
+    const autoLogs = []
+    const autoInfoLogs = new Set()
+    const autoLog = (event, details = {}) => {
+        const line = `${new Date().toISOString()} ${event} ${JSON.stringify(details)}`
+        autoLogs.push(line)
+        if (autoLogs.length > 100) autoLogs.shift()
+        console.warn('[CCB测速]', line)
+    }
+    const autoEnabled = () => getContextKey() === 'main' && getTargetCdnNode('main') === autoCdnNode
+    const autoSettingsSignature = () => JSON.stringify([getTargetCdnNode('main'), getRegion('main'),
+        GM_getValue('CCB_auto_concurrency', 1), GM_getValue('CCB_auto_refine', true),
+        GM_getValue('powerMode', true), GM_getValue('liveMode', false)])
+    const autoAllowedHost = (host) => /(?:^|\.)(?:bilivideo\.(?:com|cn)|acgvideo\.(?:com|cn)|akamaized\.net|edge\.mountaintoys\.cn)$/i.test(host)
+
+    // AUTO_CDN_HELPERS_START
+    // Target roughly 1.25 seconds of transfer, leaving room for connection setup.
+    const autoRefineBytes = speed => Math.max(256 * 1024, Math.min(2 * 1024 * 1024,
+        Math.floor((Number(speed) || 0) * 1.25 / 8 / 65536) * 65536))
+    const autoPlayData = info => {
+        let data = info
+        for (let depth = 0; depth < 6 && data && typeof data === 'object'; depth++) {
+            if (data.code !== undefined && data.code !== 0) return null
+            if (data.dash || data.durl) return data
+            const next = data.video_info || data.data || data.result || data.playInfo || data.playurl || data.__playinfo__
+            if (!next || next === data) break
+            data = next
+        }
+        return data && typeof data === 'object' ? data : null
+    }
+    const chooseAutoTrack = (info, supports) => {
+        const data = autoPlayData(info)
+        if (!data) return null
+        const dash = data.dash
+        if (!dash || !Array.isArray(dash.video)) return null
+        const videos = dash.video.filter(v => v && (v.baseUrl || v.base_url) && (!v.codecs || supports(v.codecs)))
+        // quality IDs are not an ordinal (e.g. 74 is 720P60, 116 is 1080P60).
+        const rank = id => [16, 32, 64, 74, 80, 112, 116, 120, 125, 126, 127].indexOf(Number(id))
+        videos.sort((a, b) => rank(b.id) - rank(a.id) || Number(b.bandwidth || 0) - Number(a.bandwidth || 0))
+        const video = videos[0]
+        if (!video) return null
+        const audio = (Array.isArray(dash.audio) ? dash.audio : []).slice().sort((a, b) => Number(b.bandwidth || 0) - Number(a.bandwidth || 0))[0]
+        const quality = Number(video.id)
+        const advertised = Array.isArray(data.accept_quality) ? data.accept_quality : []
+        return {
+            url: video.baseUrl || video.base_url,
+            audioUrl: audio && (audio.baseUrl || audio.base_url),
+            quality, codec: video.codecs || '',
+            bitrate: Number(video.bandwidth || 0) + Number(audio && audio.bandwidth || 0),
+            highestKnown: advertised.length > 0 && advertised.every(q => rank(q) <= rank(quality)),
+        }
+    }
+    const validAutoSample = (res, bytes, url) => {
+        if (!res || res.status !== 206 || !res.response || res.response.byteLength !== bytes) return false
+        const match = /(?:^|\n)content-range:\s*bytes\s+0-(\d+)\/(\d+)/i.exec(res.responseHeaders || '')
+        if (!match || Number(match[1]) !== bytes - 1 || Number(match[2]) < bytes) return false
+        try { return !res.finalUrl || new URL(res.finalUrl).host === new URL(url).host } catch (_) { return false }
+    }
+    const autoPool = async (items, concurrency, work, cancelled) => {
+        let index = 0
+        await Promise.all(Array.from({ length: Math.min(items.length, concurrency) }, async () => {
+            while (!cancelled() && index < items.length) await work(items[index++])
+        }))
+    }
+    // AUTO_CDN_HELPERS_END
+
+    const publishAutoHost = (host) => {
+        autoHost = host
+        autoObservedHost = ''
+        invalidateCcbCaches()
+        if (autoChannel) sendAutoConfig()
+    }
+    const sendAutoConfig = () => {
+        const config = getCcbConfig()
+        autoChannel.postMessage({ type: 'config', host: config.replacementHost, replacement: config.replacement,
+            enabled: shouldApplyReplacement(), automatic: autoEnabled() })
+    }
+    const cancelAuto = () => {
+        if (autoJob) {
+            autoJob.cancelled = true
+            for (const abort of autoJob.aborts) abort()
+            autoJob = null
+        }
+    }
+    const resetAuto = () => {
+        cancelAuto()
+        autoSettingsSeen = autoSettingsSignature()
+        autoCompletedKey = ''
+        autoFailed.clear()
+        publishAutoHost('')
+        autoStatus = '等待视频地址，取得后立即测速'
+    }
+    const failAutoHost = (host) => {
+        if (!autoEnabled() || !host || host !== autoHost) return
+        autoLog('播放请求失败，回退原始源', { host })
+        autoFailed.add(host)
+        cancelAuto()
+        publishAutoHost('')
+        GM_setValue(`CCB_auto_cache_${getRegion('main')}`, null)
+        autoStatus = '优选节点请求失败，后续请求已回退原始源；可重新测速'
+    }
+    const observeAutoInfo = (info, source = '播放接口') => {
+        if (!autoEnabled()) return
+        if (location.href !== autoPage) {
+            autoPage = location.href
+            autoTrack = null
+            resetAuto()
+        }
+        const supports = codec => {
+            try {
+                const mediaSource = unsafeWindow.MediaSource || unsafeWindow.ManagedMediaSource
+                if (mediaSource && typeof mediaSource.isTypeSupported === 'function') return mediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`)
+                const video = document.querySelector('video')
+                return !!video && typeof video.canPlayType === 'function' && !!video.canPlayType(`video/mp4; codecs="${codec}"`)
+            } catch (_) { return false }
+        }
+        const data = autoPlayData(info)
+        const videos = data && data.dash && Array.isArray(data.dash.video) ? data.dash.video : []
+        const track = chooseAutoTrack(info, supports)
+        const diagnostic = {
+            source, code: info && info.code, keys: data ? Object.keys(data).slice(0, 20) : [],
+            dashTracks: videos.length, hasDurl: !!(data && data.durl),
+            mediaSource: typeof unsafeWindow.MediaSource, managedMediaSource: typeof unsafeWindow.ManagedMediaSource,
+            tracks: videos.filter(Boolean).slice(0, 20).map(v => ({ quality: v.id, codec: v.codecs,
+                hasUrl: !!(v.baseUrl || v.base_url), supported: !v.codecs || supports(v.codecs) })),
+            selectedQuality: track && track.quality,
+        }
+        const signature = JSON.stringify(diagnostic)
+        if (!autoInfoLogs.has(signature)) {
+            if (autoInfoLogs.size >= 30) autoInfoLogs.clear()
+            autoInfoLogs.add(signature)
+            autoLog('播放信息检查', diagnostic)
+        }
+        if (!track) {
+            // Bootstrap state is not necessarily a playurl response. Do not overwrite a valid job/result.
+            if (!autoTrack) autoStatus = videos.length
+                ? 'DASH 轨道被编码或地址校验过滤（请查看测速日志）'
+                : '等待包含 DASH 轨道的播放信息（请查看测速日志）'
+            return
+        }
+        try {
+            const url = new URL(track.url)
+            if (!autoAllowedHost(url.hostname)) return
+            track.key = `${url.pathname}|${track.quality}|${track.codec}`
+        } catch (_) { return }
+        if (autoTrack && track.key === autoTrack.key) {
+            // Keep identity stable while a job is running, refresh expiring URLs between jobs.
+            if (!autoJob) Object.assign(autoTrack, track)
+            return
+        }
+        resetAuto()
+        autoTrack = track
+    }
+    const autoBufferReady = () => {
+        const video = document.querySelector('video')
+        if (!video || video.paused || video.seeking || video.readyState < 3) return false
+        for (let i = 0; i < video.buffered.length; i++) {
+            if (video.buffered.start(i) <= video.currentTime && video.buffered.end(i) - video.currentTime >= 5) return true
+        }
+        return false
+    }
+    const autoCanApply = () => {
+        const video = document.querySelector('video')
+        return !video || video.paused || autoBufferReady()
+    }
+    const sampleAuto = (job, rawUrl, host, bytes) => new Promise(resolve => {
+        if (job.cancelled || Date.now() >= job.deadline || job.bytes + bytes > 8 * 1024 * 1024) {
+            autoLog('跳过采样', { host: host || '原始源', reason: job.cancelled ? '任务取消' : Date.now() >= job.deadline ? '时间预算耗尽' : '字节预算耗尽' })
+            return resolve(null)
+        }
+        const url = new URL(rawUrl)
+        if (host) url.hostname = host
+        if (!autoAllowedHost(url.hostname) || url.protocol !== 'https:') return resolve(null)
+        job.bytes += bytes
+        const started = performance.now()
+        let request, timeoutTimer, finished = false
+        let lastStatus = null
+        const finish = (result, reason = '有效响应', res = {}) => {
+            if (finished) return
+            res = res || {}
+            finished = true
+            clearTimeout(timeoutTimer)
+            job.aborts.delete(abort)
+            job.lastSampleFailure = result ? '' : reason
+            let finalHost = ''
+            try { finalHost = new URL(res.finalUrl).host } catch (_) {}
+            const range = /(?:^|\n)content-range:\s*([^\r\n]+)/i.exec(res.responseHeaders || '')
+            autoLog('采样结果', { phase: job.phase, host: url.host, reason,
+                status: Number.isFinite(res.status) ? res.status : lastStatus,
+                requestedBytes: bytes, receivedBytes: res.response && res.response.byteLength,
+                contentRange: range ? range[1] : null, finalHost,
+                elapsedMs: Math.round(performance.now() - started),
+                Mbps: result ? Number((result.speed / 1e6).toFixed(2)) : null })
+            resolve(result)
+        }
+        const abort = (reason = '任务取消或总时限到达', res) => { finish(null, reason, res); if (request) request.abort() }
+        job.aborts.add(abort)
+        timeoutTimer = setTimeout(() => abort('单节点超时'), Math.max(1, Math.min(2500, job.deadline - Date.now())))
+        try {
+            request = GM_xmlhttpRequest({
+                // anonymous/redirect options force fetch mode in Tampermonkey and disable
+                // Chrome progress/header callbacks. Keep XHR mode to stop ignored ranges.
+                method: 'GET', url: url.href, responseType: 'arraybuffer', fetch: false, nocache: true,
+                headers: { Range: `bytes=0-${bytes - 1}`, Referer: 'https://www.bilibili.com/' },
+                timeout: Math.max(1, Math.min(2500, job.deadline - Date.now())),
+                onreadystatechange: res => {
+                    if (Number.isFinite(res.status)) lastStatus = res.status
+                    // A header callback may not yet expose a status; only reject a known final status.
+                    if (res.readyState === 2 && res.status >= 200 && res.status !== 206) abort('HTTP 状态不是 206', res)
+                },
+                onprogress: event => { if (event.loaded > bytes || job.cancelled) abort(event.loaded > bytes ? '返回数据超过 Range，已中止' : '任务取消') },
+                onload: res => {
+                    const seconds = Math.max(0.001, (performance.now() - started) / 1000)
+                    const valid = !job.cancelled && validAutoSample(res, bytes, url.href)
+                    const reason = job.cancelled ? '任务取消' : res.status !== 206 ? 'HTTP 状态不是 206'
+                        : !res.response || res.response.byteLength !== bytes ? '响应字节数不匹配'
+                        : !valid ? 'Content-Range 或最终域名不匹配' : '有效响应'
+                    finish(valid ? { host, speed: bytes * 8 / seconds } : null, reason, res)
+                },
+                onerror: res => finish(null, '网络错误或连接权限受限（需结合浏览器日志）', res),
+                ontimeout: res => finish(null, '单节点超时', res), onabort: () => finish(null, '请求被中止'),
+            })
+        } catch (_) { finish(null, 'GM_xmlhttpRequest 调用异常') }
+    })
+    const runAuto = async () => {
+        const track = autoTrack
+        const region = getRegion('main')
+        const settings = autoSettingsSignature()
+        const job = { cancelled: false, sampling: true, aborts: new Set(), bytes: 0, deadline: Date.now() + 8000 }
+        autoJob = job
+        autoLog('开始测速', { region, quality: track.quality, codec: track.codec, bitrate: track.bitrate,
+            concurrency: GM_getValue('CCB_auto_concurrency', 1), refine: GM_getValue('CCB_auto_refine', true) })
+        autoCompletedKey = track.key
+        const deadline = setTimeout(() => { for (const abort of job.aborts) abort() }, 8000)
+        const cancelled = () => job.cancelled || !autoEnabled() || settings !== autoSettingsSignature() || autoTrack !== track || Date.now() >= job.deadline
+        try {
+            if (!cdnDataCache) loadDataCache()
+            if (!cdnDataCache) await Promise.race([getCdnData(), new Promise(resolve => setTimeout(resolve, 2000))])
+            if (cancelled()) return
+            const originalHost = new URL(track.url).hostname.toLowerCase()
+            const candidates = [...new Set(['', ...getCdnListByRegion(region)
+                .filter(host => autoAllowedHost(host)).map(host => host.toLowerCase())
+                .filter(host => host !== originalHost)])]
+                .filter(host => !autoFailed.has(host)).slice(0, 11)
+            const cached = GM_getValue(`CCB_auto_cache_${region}`, null)
+            autoLog('候选节点', { hosts: candidates.map(host => host || '原始源') })
+            let winner = null
+            if (cached && Date.now() - cached.time < 10 * 60 * 1000 && candidates.includes(cached.host)) {
+                autoStatus = '验证上次优选节点…'
+                job.phase = '缓存验证'
+                const result = await sampleAuto(job, track.url, cached.host, 1024 * 1024)
+                if (result && track.bitrate > 0 && result.speed >= track.bitrate * 2) winner = result
+            }
+            if (!winner && !cancelled()) {
+                const results = []
+                job.phase = '初筛'
+                const concurrency = Math.max(1, Math.min(8, Number(GM_getValue('CCB_auto_concurrency', 1)) || 1))
+                let done = 0
+                await autoPool(candidates, concurrency, async host => {
+                    autoStatus = `初筛 ${done}/${candidates.length}，并发 ${concurrency}`
+                    const result = await sampleAuto(job, track.url, host, 256 * 1024)
+                    if (result) results.push(result)
+                    done++
+                }, cancelled)
+                results.sort((a, b) => b.speed - a.speed)
+                autoLog('初筛完成', { valid: results.length, total: candidates.length })
+                if (GM_getValue('CCB_auto_refine', true)) {
+                    job.phase = '复测'
+                    const finalists = results.slice(0, 2)
+                    const refined = []
+                    const timedOut = []
+                    for (const result of finalists) {
+                        if (cancelled()) break
+                        autoStatus = '精确复测前两名…'
+                        const sample = await sampleAuto(job, track.url, result.host, autoRefineBytes(result.speed))
+                        if (sample) refined.push(sample)
+                        else if (job.lastSampleFailure === '单节点超时') timedOut.push(result)
+                    }
+                    refined.sort((a, b) => b.speed - a.speed)
+                    winner = refined[0] || (timedOut.length ? { ...timedOut[0], provisional: true } : null)
+                    if (winner && winner.provisional) autoLog('复测超时，保留初筛估算', { host: winner.host || '原始源' })
+                } else winner = results[0]
+            }
+            if (cancelled()) { if (!job.cancelled) autoStatus = '测速达到 8 秒预算，保持当前源'; return }
+            if (!winner) { autoStatus = '没有取得有效测速结果，保持当前源（请查看测速日志）'; autoLog('没有可用结果', { phase: job.phase }); return }
+            job.phase = '音频校验'
+            if (winner.host && track.audioUrl && !await sampleAuto(job, track.audioUrl, winner.host, 16 * 1024)) {
+                autoStatus = '候选节点音频校验失败，保持当前源'; return
+            }
+            if (cancelled()) return
+            clearTimeout(deadline)
+            job.sampling = false
+            autoStatus = `已选出 ${winner.host || '原始源'}，播放中需 5 秒缓冲，暂停时直接应用`
+            // Do not interrupt downloads or force a reload to apply the winner.
+            while (!job.cancelled && autoEnabled() && settings === autoSettingsSignature() && autoTrack === track && !autoCanApply()) {
+                await new Promise(resolve => setTimeout(resolve, 500))
+            }
+            if (job.cancelled || !autoEnabled() || settings !== autoSettingsSignature() || autoTrack !== track) return
+            publishAutoHost(winner.host)
+            autoLog('应用优选节点', { host: winner.host || '原始源', Mbps: Number((winner.speed / 1e6).toFixed(2)) })
+            if (!winner.provisional) GM_setValue(`CCB_auto_cache_${region}`, { host: winner.host, time: Date.now() })
+            const margin = track.bitrate > 0 ? `，码率余量 ${(winner.speed / track.bitrate).toFixed(1)} 倍` : ''
+            autoStatus = `${winner.provisional ? '复测超时，仅初筛估算 · ' : ''}${track.highestKnown ? '响应内最高画质' : '已返回画质（未确认最高）'} Q${track.quality}：${(winner.speed / 1e6).toFixed(1)} Mbps${margin} → ${winner.host || '原始源'}（后续请求生效）`
+        } catch (error) {
+            if (!job.cancelled) autoStatus = '测速失败，保持当前源'
+            logger('自动优选失败:', String(error))
+        } finally {
+            clearTimeout(deadline)
+            for (const abort of job.aborts) abort()
+            if (autoJob === job) autoJob = null
+        }
+    }
     const manualRegionName = '手动输入'
     const mainHost = 'www.bilibili.com'
     const liveHost = 'live.bilibili.com'
@@ -113,6 +442,7 @@
             value,
         )
         invalidateCcbCaches()
+        if (ctx === 'main') resetAuto()
         return result
     }
     const setRegion = (ctx, value) => {
@@ -121,6 +451,7 @@
             value,
         )
         invalidateCcbCaches()
+        if (ctx === 'main') resetAuto()
         return result
     }
     const getPowerMode = () => getCcbConfig().powerMode
@@ -132,7 +463,7 @@
 
         const storedNode = getTargetCdnNode(contextKey)
         // 存储被写坏时退回默认源，避免后续字符串操作抛错
-        const node = typeof storedNode === 'string' ? storedNode : defaultCdnNode
+        const node = storedNode === autoCdnNode ? (autoHost || defaultCdnNode) : (typeof storedNode === 'string' ? storedNode : defaultCdnNode)
         const region = getRegion(contextKey)
         const powerMode = GM_getValue(powerModeStored, true)
         const liveMode = GM_getValue(liveModeStored, false)
@@ -150,7 +481,7 @@
         return ccbConfigCache
     }
 
-    const isCcbEnabled = () => getCcbConfig().node !== defaultCdnNode
+    const isCcbEnabled = () => autoEnabled() || getCcbConfig().node !== defaultCdnNode
     const hasMediaDomain = (s) => typeof s === 'string' && (
         s.indexOf('bilivideo.') !== -1
         || s.indexOf('acgvideo.') !== -1
@@ -175,7 +506,7 @@
     }
 
     const shouldInstallWorkerHooks = () => {
-        if (!shouldApplyReplacement()) return false
+        if (!autoEnabled() && !shouldApplyReplacement()) return false
         const host = location.host
         const pathname = location.pathname || '/'
         if (host === mainHost) {
@@ -362,7 +693,11 @@
         }
     }
 
-    const transformPlayUrlResponse = (playInfo) => {
+    const transformPlayUrlResponse = (playInfo, source) => {
+        if (autoEnabled()) {
+            observeAutoInfo(playInfo, source)
+            return
+        }
         if (!shouldApplyReplacement()) return
         if (!playInfo || typeof playInfo !== 'object') return
         if (playInfo.code !== (void 0) && playInfo.code !== 0) return
@@ -418,10 +753,31 @@
     }
 
     const installCcbWorkerRuntime = (cfg) => {
-        const forceReplace = !!(cfg && cfg.forceReplace)
+        if (self.__CCB_WORKER_RUNTIME__) return
+        self.__CCB_WORKER_RUNTIME__ = true
+        let forceReplace = !!(cfg && cfg.forceReplace)
         const shouldApply = () => forceReplace
-        const Replacement = (cfg && typeof cfg.replacement === 'string') ? cfg.replacement : ''
-        const replacementHost = (cfg && typeof cfg.replacementHost === 'string') ? cfg.replacementHost : ''
+        let Replacement = (cfg && typeof cfg.replacement === 'string') ? cfg.replacement : ''
+        let replacementHost = (cfg && typeof cfg.replacementHost === 'string') ? cfg.replacementHost : ''
+        let automatic = !!cfg.automatic
+        let channel
+        try {
+            channel = new BroadcastChannel(cfg.autoChannelName)
+            channel.onmessage = event => {
+                const message = event.data
+                if (!message || message.type !== 'config') return
+                automatic = !!message.automatic
+                replacementHost = message.host || ''
+                Replacement = message.replacement || (replacementHost ? `https://${replacementHost}/` : '')
+                forceReplace = !!message.enabled
+            }
+            channel.postMessage({ type: 'ready' })
+        } catch (_) {}
+        const failed = host => {
+            if (!automatic || host !== replacementHost) return
+            forceReplace = false
+            if (channel) channel.postMessage({ type: 'failed', host })
+        }
         const getHost = () => replacementHost
         const IGNORE_HOST_RE = /^(?:bvc|data|pbp|api|api\w+)\./
         const HOST_EXTRACT_RE = /^(?:https?:)?\/\/([\w.-]+)|^([\w.-]+)(?:\/|$)/i
@@ -451,11 +807,16 @@
         const Ofetch = self.fetch
         if (Ofetch) {
             self.fetch = (input, init) => {
+                const original = input
+                const host = replacementHost
+                let changed = false
                 try {
                     const s = typeof input === 'string' ? input : (input && input.url)
                     if (typeof s === 'string') {
                         const r = replaceUrl(s)
                         if (r !== s) {
+                            changed = true
+                            if (automatic && channel) channel.postMessage({ type: 'used', host })
                             if (typeof input === 'string') input = r
                             else {
                                 const Req = self.Request || Request
@@ -464,7 +825,14 @@
                         }
                     }
                 } catch (_) {}
-                return Ofetch(input, init)
+                const pending = Ofetch(input, init)
+                if (!automatic || !changed) return pending
+                const retry = error => {
+                    if ((init && init.signal && init.signal.aborted) || (original && original.signal && original.signal.aborted)) throw error
+                    failed(host)
+                    return Ofetch(original, init)
+                }
+                return pending.then(response => response.ok ? response : retry(new Error('CDN HTTP error')), retry)
             }
         }
 
@@ -472,9 +840,21 @@
             const OX = self.XMLHttpRequest
             class X extends OX {
                 open(...args) {
+                    const original = args[1]
+                    const host = replacementHost
                     try {
                         if (typeof args[1] === 'string') args[1] = replaceUrl(args[1])
                     } catch (_) {}
+                    this._ccbAutoFailure = () => {
+                        if (automatic && args[1] !== original && (this.status === 0 || this.status >= 400)) failed(host)
+                    }
+                    if (automatic && args[1] !== original && channel) channel.postMessage({ type: 'used', host })
+                    if (!this._ccbAutoListening) {
+                        this._ccbAutoListening = true
+                        this.addEventListener('load', () => this._ccbAutoFailure())
+                        this.addEventListener('error', () => this._ccbAutoFailure())
+                        this.addEventListener('timeout', () => this._ccbAutoFailure())
+                    }
                     return super.open(...args)
                 }
             }
@@ -487,6 +867,7 @@
         if (workerPreludeCache && workerPreludeContextKey === contextKey) return workerPreludeCache
 
         const cfg = {
+            automatic: autoEnabled(), autoChannelName,
             forceReplace: shouldApplyReplacement(),
             replacement: getReplacement(),
             replacementHost: getReplacementHost(),
@@ -521,13 +902,25 @@
                 const OX = w.XMLHttpRequest
                 class XHR extends OX {
                     open(...args) {
+                        const original = args[1]
+                        const host = autoHost
                         this._ccbIntercept = false
                         this._ccbResponseMemo = xhrMemoUnset
                         this._ccbResponseTextMemo = xhrMemoUnset
                         try {
                             if (typeof args[1] === 'string') args[1] = replaceMediaUrl(args[1])
+                            if (autoEnabled() && args[1] !== original) autoObservedHost = host
                             this._ccbIntercept = !!handle(null, args[1], { type: 'xhr', xhr: this })
                         } catch (_) {}
+                        this._ccbAutoFailure = () => {
+                            if (args[1] !== original && (this.status === 0 || this.status >= 400)) failAutoHost(host)
+                        }
+                        if (!this._ccbAutoListening) {
+                            this._ccbAutoListening = true
+                            this.addEventListener('load', () => this._ccbAutoFailure())
+                            this.addEventListener('error', () => this._ccbAutoFailure())
+                            this.addEventListener('timeout', () => this._ccbAutoFailure())
+                        }
                         return super.open(...args)
                     }
                     get responseText() {
@@ -552,10 +945,15 @@
 
                 const Ofetch = w.fetch
                 w.fetch = (input, init) => {
+                    const original = input
+                    const host = autoHost
+                    let changed = false
                     const s0 = typeof input === 'string' ? input : (input && input.url)
                     if (typeof s0 === 'string') {
                         const r = replaceMediaUrl(s0)
                         if (r !== s0) {
+                            changed = true
+                            if (autoEnabled()) autoObservedHost = host
                             if (typeof input === 'string') input = r
                             else input = new (w.Request || Request)(r, input)
                         }
@@ -563,7 +961,16 @@
 
                     const s = typeof input === 'string' ? input : (input && input.url)
                     const shouldIntercept = handle(null, s, { type: 'fetch', input, init })
-                    if (!shouldIntercept) return Ofetch(input, init)
+                    if (!shouldIntercept) {
+                        const pending = Ofetch(input, init)
+                        if (!autoEnabled() || !changed) return pending
+                        const retry = error => {
+                            if ((init && init.signal && init.signal.aborted) || (original && original.signal && original.signal.aborted)) throw error
+                            failAutoHost(host)
+                            return Ofetch(original, init)
+                        }
+                        return pending.then(response => response.ok ? response : retry(new Error('CDN HTTP error')), retry)
+                    }
                     return Ofetch(input, init).then(resp => {
                         // 老引擎没有 Response.body 属性,不能把"属性缺失"当成"空响应体"
                         if (('body' in resp && !resp.body) || resp.status === 204 || resp.status === 205 || resp.status === 304) return resp
@@ -741,11 +1148,11 @@
 
     watchGlobal('__playinfo__', (obj) => {
         if (!isCcbEnabled()) return
-        try { transformPlayUrlResponse(obj) } catch (_) {}
+        try { transformPlayUrlResponse(obj, '__playinfo__') } catch (_) {}
     })
     watchGlobal('__INITIAL_STATE__', (obj) => {
         if (!isCcbEnabled()) return
-        try { transformPlayUrlResponse(obj) } catch (_) {}
+        try { transformPlayUrlResponse(obj, '__INITIAL_STATE__') } catch (_) {}
     })
 
     const createButton = (text, primary, second) => {
@@ -1097,6 +1504,7 @@
                 }
 
                 const list = getCdnListByRegion(regionValue)
+                if (ctx === 'main') list.splice(1, 0, autoCdnNode)
                 // 用户切换地区时按列表回落并写入,其余场景只如实展示已保存的节点
                 const options = persist ? list : withStoredNode(list, stored)
                 if (nodeSelect) {
@@ -1144,6 +1552,59 @@
         mainBox.appendChild(mkSectionTitle('视频 | 课堂 | 番剧(需特殊设置)'))
         body.appendChild(mainBox)
         mountRegionAndNode('main', mainBox)
+        const autoSettings = document.createElement('div')
+        autoSettings.style.cssText = 'margin-top:10px;line-height:1.8;color:#ccc;font-size:12px'
+        const concurrencyLabel = document.createElement('label')
+        concurrencyLabel.textContent = '自动测速并发数：'
+        const concurrencyInput = document.createElement('select')
+        for (let i = 1; i <= 8; i++) appendOption(concurrencyInput, String(i))
+        concurrencyInput.value = String(GM_getValue('CCB_auto_concurrency', 1))
+        concurrencyInput.addEventListener('change', () => {
+            GM_setValue('CCB_auto_concurrency', Number(concurrencyInput.value))
+            resetAuto()
+        })
+        concurrencyLabel.appendChild(concurrencyInput)
+        autoSettings.appendChild(concurrencyLabel)
+        const refineLabel = document.createElement('label')
+        refineLabel.style.marginLeft = '12px'
+        const refineInput = document.createElement('input')
+        refineInput.type = 'checkbox'
+        refineInput.checked = GM_getValue('CCB_auto_refine', true)
+        refineInput.addEventListener('change', () => { GM_setValue('CCB_auto_refine', refineInput.checked); resetAuto() })
+        refineLabel.append(refineInput, '前两名精确复测')
+        autoSettings.appendChild(refineLabel)
+        const status = document.createElement('div')
+        status.style.cssText = 'overflow-wrap:anywhere;margin:6px 0'
+        const updateStatus = () => {
+            status.textContent = autoEnabled()
+                ? `${autoStatus}${autoObservedHost ? ' · 已发起新节点请求' : ''}`
+                : '选择“自动优选（当前地区）”后启用；取得视频地址即测速，无需播放'
+        }
+        updateStatus()
+        const statusTimer = setInterval(() => { if (!status.isConnected) clearInterval(statusTimer); else updateStatus() }, 500)
+        autoSettings.appendChild(status)
+        const retest = createButton('重新测速', false, false)
+        retest.addEventListener('click', () => {
+            GM_setValue(`CCB_auto_cache_${getRegion('main')}`, null)
+            resetAuto()
+        })
+        autoSettings.appendChild(retest)
+        const logDetails = document.createElement('details')
+        const logTitle = document.createElement('summary')
+        logTitle.textContent = '测速日志（展开后可全选复制）'
+        const logText = document.createElement('textarea')
+        logText.readOnly = true
+        logText.rows = 10
+        logText.style.cssText = 'width:100%;box-sizing:border-box;background:#111;color:#ddd;font:11px monospace'
+        logText.value = autoLogs.join('\n')
+        logDetails.addEventListener('toggle', () => { if (logDetails.open) logText.value = autoLogs.join('\n') })
+        const logTimer = setInterval(() => {
+            if (!logDetails.isConnected) { clearInterval(logTimer); return }
+            if (logDetails.open && document.activeElement !== logText) logText.value = autoLogs.join('\n')
+        }, 1000)
+        logDetails.append(logTitle, logText)
+        autoSettings.appendChild(logDetails)
+        mainBox.appendChild(autoSettings)
 
         const liveBox = mkSectionBox()
         liveBox.appendChild(mkSectionTitle('直播'))
@@ -1190,5 +1651,30 @@
         GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
     }
 
+    try {
+        autoChannel = new BroadcastChannel(autoChannelName)
+        autoChannel.onmessage = event => {
+            const message = event.data
+            if (!message) return
+            if (message.type === 'ready') sendAutoConfig()
+            if (message.type === 'failed') failAutoHost(message.host)
+            if (message.type === 'used' && message.host === autoHost) autoObservedHost = message.host
+        }
+    } catch (_) {}
+    autoSettingsSeen = autoSettingsSignature()
+    setInterval(() => {
+        if (autoSettingsSeen !== autoSettingsSignature()) resetAuto()
+        if (location.href !== autoPage) {
+            autoPage = location.href
+            autoTrack = null
+            resetAuto()
+        }
+        if (!autoEnabled()) { if (autoJob) cancelAuto(); return }
+        // Recover an already-present bootstrap object when auto mode was enabled after page startup.
+        if (!autoTrack && unsafeWindow.__playinfo__) observeAutoInfo(unsafeWindow.__playinfo__, '__playinfo__补查')
+        if (!autoTrack || autoJob || autoCompletedKey === autoTrack.key) return
+        void runAuto()
+    }, 1000)
+    window.addEventListener('pagehide', cancelAuto)
     logger('CCB 加载完成', { host: location.host, path: location.pathname })
 })()
