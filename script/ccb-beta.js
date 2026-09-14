@@ -42,6 +42,7 @@
     let autoPage = location.href
     let autoCompletedKey = ''
     let autoSettingsSeen = ''
+    let autoStallSince = 0
     const autoFailed = new Set()
     const autoLogs = []
     const autoInfoLogs = new Set()
@@ -94,10 +95,10 @@
             highestKnown: advertised.length > 0 && advertised.every(q => rank(q) <= rank(quality)),
         }
     }
-    const validAutoSample = (res, bytes, url) => {
+    const validAutoSample = (res, bytes, url, start = 0) => {
         if (!res || res.status !== 206 || !res.response || res.response.byteLength !== bytes) return false
-        const match = /(?:^|\n)content-range:\s*bytes\s+0-(\d+)\/(\d+)/i.exec(res.responseHeaders || '')
-        if (!match || Number(match[1]) !== bytes - 1 || Number(match[2]) < bytes) return false
+        const match = /(?:^|\n)content-range:\s*bytes\s+(\d+)-(\d+)\/(\d+)/i.exec(res.responseHeaders || '')
+        if (!match || Number(match[1]) !== start || Number(match[2]) !== start + bytes - 1 || Number(match[3]) < start + bytes) return false
         try { return !res.finalUrl || new URL(res.finalUrl).host === new URL(url).host } catch (_) { return false }
     }
     const autoPool = async (items, concurrency, work, cancelled) => {
@@ -128,6 +129,7 @@
     }
     const resetAuto = () => {
         cancelAuto()
+        autoStallSince = 0
         autoSettingsSeen = autoSettingsSignature()
         autoCompletedKey = ''
         autoFailed.clear()
@@ -205,9 +207,15 @@
     }
     const autoCanApply = () => {
         const video = document.querySelector('video')
-        return !video || video.paused || autoBufferReady()
+        return !video || video.paused || video.readyState < 3 || autoBufferReady()
     }
-    const sampleAuto = (job, rawUrl, host, bytes) => new Promise(resolve => {
+    const autoBudgetKey = 'CCB_auto_budget_v1'
+    const readAutoBudget = () => {
+        const saved = GM_getValue(autoBudgetKey, {}) || {}
+        return { ...saved, ...(Date.now() - (saved.window || 0) >= 60000
+            ? { window: Date.now(), requests: 0, bytes: 0 } : {}) }
+    }
+    const sampleAuto = (job, rawUrl, host, bytes, start = 0) => new Promise(resolve => {
         if (job.cancelled || Date.now() >= job.deadline || job.bytes + bytes > 8 * 1024 * 1024) {
             autoLog('跳过采样', { host: host || '原始源', reason: job.cancelled ? '任务取消' : Date.now() >= job.deadline ? '时间预算耗尽' : '字节预算耗尽' })
             return resolve(null)
@@ -215,6 +223,13 @@
         const url = new URL(rawUrl)
         if (host) url.hostname = host
         if (!autoAllowedHost(url.hostname) || url.protocol !== 'https:') return resolve(null)
+        const budget = readAutoBudget()
+        if (Date.now() < (budget.blockedUntil || 0) || (budget.requests || 0) >= 16 || (budget.bytes || 0) + bytes > 16 * 1024 * 1024) {
+            job.cancelled = true
+            autoStatus = '共享测速预算或退避限制生效，暂不请求'
+            return resolve(null)
+        }
+        GM_setValue(autoBudgetKey, { ...budget, requests: (budget.requests || 0) + 1, bytes: (budget.bytes || 0) + bytes })
         job.bytes += bytes
         const started = performance.now()
         let request, timeoutTimer, finished = false
@@ -226,12 +241,29 @@
             clearTimeout(timeoutTimer)
             job.aborts.delete(abort)
             job.lastSampleFailure = result ? '' : reason
+            const status = Number.isFinite(res.status) ? res.status : lastStatus
+            if (status === 403 || status === 429) {
+                const shared = readAutoBudget()
+                const denied = (shared.denied || 0) + 1
+                const blocked = status === 429 || denied >= 2
+                const level = blocked ? Math.min(5, (shared.level || 0) + 1) : shared.level || 0
+                GM_setValue(autoBudgetKey, { ...shared, denied, level,
+                    blockedUntil: blocked ? Date.now() + 60000 * 2 ** level : shared.blockedUntil || 0 })
+                if (blocked) {
+                    job.cancelled = true
+                    autoStatus = '收到限流或连续拒绝，已停止测速并退避'
+                    for (const stop of [...job.aborts]) stop()
+                }
+            } else if (result) {
+                const shared = readAutoBudget()
+                GM_setValue(autoBudgetKey, { ...shared, denied: 0 })
+            }
             let finalHost = ''
             try { finalHost = new URL(res.finalUrl).host } catch (_) {}
             const range = /(?:^|\n)content-range:\s*([^\r\n]+)/i.exec(res.responseHeaders || '')
             autoLog('采样结果', { phase: job.phase, host: url.host, reason,
                 status: Number.isFinite(res.status) ? res.status : lastStatus,
-                requestedBytes: bytes, receivedBytes: res.response && res.response.byteLength,
+                requestedBytes: bytes, rangeStart: start, receivedBytes: res.response && res.response.byteLength,
                 contentRange: range ? range[1] : null, finalHost,
                 elapsedMs: Math.round(performance.now() - started),
                 Mbps: result ? Number((result.speed / 1e6).toFixed(2)) : null })
@@ -245,7 +277,7 @@
                 // anonymous/redirect options force fetch mode in Tampermonkey and disable
                 // Chrome progress/header callbacks. Keep XHR mode to stop ignored ranges.
                 method: 'GET', url: url.href, responseType: 'arraybuffer', fetch: false, nocache: true,
-                headers: { Range: `bytes=0-${bytes - 1}`, Referer: 'https://www.bilibili.com/' },
+                headers: { Range: `bytes=${start}-${start + bytes - 1}`, Referer: 'https://www.bilibili.com/' },
                 timeout: Math.max(1, Math.min(2500, job.deadline - Date.now())),
                 onreadystatechange: res => {
                     if (Number.isFinite(res.status)) lastStatus = res.status
@@ -255,11 +287,12 @@
                 onprogress: event => { if (event.loaded > bytes || job.cancelled) abort(event.loaded > bytes ? '返回数据超过 Range，已中止' : '任务取消') },
                 onload: res => {
                     const seconds = Math.max(0.001, (performance.now() - started) / 1000)
-                    const valid = !job.cancelled && validAutoSample(res, bytes, url.href)
+                    const valid = !job.cancelled && validAutoSample(res, bytes, url.href, start)
                     const reason = job.cancelled ? '任务取消' : res.status !== 206 ? 'HTTP 状态不是 206'
                         : !res.response || res.response.byteLength !== bytes ? '响应字节数不匹配'
                         : !valid ? 'Content-Range 或最终域名不匹配' : '有效响应'
-                    finish(valid ? { host, speed: bytes * 8 / seconds } : null, reason, res)
+                    const total = /content-range:\s*bytes\s+\d+-\d+\/(\d+)/i.exec(res.responseHeaders || '')
+                    finish(valid ? { host, speed: bytes * 8 / seconds, total: Number(total[1]) } : null, reason, res)
                 },
                 onerror: res => finish(null, '网络错误或连接权限受限（需结合浏览器日志）', res),
                 ontimeout: res => finish(null, '单节点超时', res), onabort: () => finish(null, '请求被中止'),
@@ -267,6 +300,26 @@
         } catch (_) { finish(null, 'GM_xmlhttpRequest 调用异常') }
     })
     const runAuto = async () => {
+        // Web Locks serialize read/modify/write of GM storage across same-origin tabs.
+        // Fail closed where atomic coordination is unavailable.
+        if (typeof navigator === 'undefined' || !navigator.locks) {
+            autoStatus = '浏览器不支持共享测速锁，请手动选择节点'
+            return
+        }
+        await navigator.locks.request('CCB-auto-probes-v1', { ifAvailable: true }, async lock => {
+            if (!lock || autoJob || !autoTrack || !autoEnabled()) return
+            const budget = readAutoBudget()
+            const until = Math.max(budget.next || 0, budget.blockedUntil || 0,
+                (budget.requests || 0) >= 16 || (budget.bytes || 0) >= 16 * 1024 * 1024 ? budget.window + 60000 : 0)
+            if (Date.now() < until) {
+                autoStatus = `共享测速冷却中，约 ${Math.ceil((until - Date.now()) / 1000)} 秒后可测`
+                return
+            }
+            GM_setValue(autoBudgetKey, { ...budget, next: Date.now() + 30000 })
+            await runAutoLocked()
+        })
+    }
+    const runAutoLocked = async () => {
         const track = autoTrack
         const region = getRegion('main')
         const settings = autoSettingsSignature()
@@ -293,7 +346,8 @@
                 autoStatus = '验证上次优选节点…'
                 job.phase = '缓存验证'
                 const result = await sampleAuto(job, track.url, cached.host, 1024 * 1024)
-                if (result && track.bitrate > 0 && result.speed >= track.bitrate * 2) winner = result
+                // A single prefix sample is only a shortlist hint, never a winner.
+                if (result) job.cachedSample = result
             }
             if (!winner && !cancelled()) {
                 const results = []
@@ -302,7 +356,8 @@
                 let done = 0
                 await autoPool(candidates, concurrency, async host => {
                     autoStatus = `初筛 ${done}/${candidates.length}，并发 ${concurrency}`
-                    const result = await sampleAuto(job, track.url, host, 256 * 1024)
+                    const result = job.cachedSample && job.cachedSample.host === host
+                        ? job.cachedSample : await sampleAuto(job, track.url, host, 256 * 1024)
                     if (result) results.push(result)
                     done++
                 }, cancelled)
@@ -312,17 +367,16 @@
                     job.phase = '复测'
                     const finalists = results.slice(0, 2)
                     const refined = []
-                    const timedOut = []
                     for (const result of finalists) {
                         if (cancelled()) break
                         autoStatus = '精确复测前两名…'
-                        const sample = await sampleAuto(job, track.url, result.host, autoRefineBytes(result.speed))
-                        if (sample) refined.push(sample)
-                        else if (job.lastSampleFailure === '单节点超时') timedOut.push(result)
+                        const bytes = Math.min(autoRefineBytes(result.speed), Math.floor(result.total / 2))
+                        const start = Math.floor(result.total / 2)
+                        const sample = bytes > 0 ? await sampleAuto(job, track.url, result.host, bytes, start) : null
+                        if (sample) refined.push({ ...sample, speed: Math.min(result.speed, sample.speed) })
                     }
                     refined.sort((a, b) => b.speed - a.speed)
-                    winner = refined[0] || (timedOut.length ? { ...timedOut[0], provisional: true } : null)
-                    if (winner && winner.provisional) autoLog('复测超时，保留初筛估算', { host: winner.host || '原始源' })
+                    winner = refined[0] || null
                 } else winner = results[0]
             }
             if (cancelled()) { if (!job.cancelled) autoStatus = '测速达到 8 秒预算，保持当前源'; return }
@@ -334,17 +388,18 @@
             if (cancelled()) return
             clearTimeout(deadline)
             job.sampling = false
-            autoStatus = `已选出 ${winner.host || '原始源'}，播放中需 5 秒缓冲，暂停时直接应用`
+            autoStatus = `已选出 ${winner.host || '原始源'}，准备应用到后续请求`
             // Do not interrupt downloads or force a reload to apply the winner.
-            while (!job.cancelled && autoEnabled() && settings === autoSettingsSignature() && autoTrack === track && !autoCanApply()) {
+            const applyDeadline = Date.now() + 3000
+            while (!job.cancelled && autoEnabled() && settings === autoSettingsSignature() && autoTrack === track && !autoCanApply() && Date.now() < applyDeadline) {
                 await new Promise(resolve => setTimeout(resolve, 500))
             }
             if (job.cancelled || !autoEnabled() || settings !== autoSettingsSignature() || autoTrack !== track) return
             publishAutoHost(winner.host)
             autoLog('应用优选节点', { host: winner.host || '原始源', Mbps: Number((winner.speed / 1e6).toFixed(2)) })
-            if (!winner.provisional) GM_setValue(`CCB_auto_cache_${region}`, { host: winner.host, time: Date.now() })
+            GM_setValue(`CCB_auto_cache_${region}`, { host: winner.host, time: Date.now() })
             const margin = track.bitrate > 0 ? `，码率余量 ${(winner.speed / track.bitrate).toFixed(1)} 倍` : ''
-            autoStatus = `${winner.provisional ? '复测超时，仅初筛估算 · ' : ''}${track.highestKnown ? '响应内最高画质' : '已返回画质（未确认最高）'} Q${track.quality}：${(winner.speed / 1e6).toFixed(1)} Mbps${margin} → ${winner.host || '原始源'}（后续请求生效）`
+            autoStatus = `${track.highestKnown ? '响应内最高画质' : '已返回画质（未确认最高）'} Q${track.quality}：${(winner.speed / 1e6).toFixed(1)} Mbps${margin} → ${winner.host || '原始源'}（后续请求生效）`
         } catch (error) {
             if (!job.cancelled) autoStatus = '测速失败，保持当前源'
             logger('自动优选失败:', String(error))
@@ -1672,7 +1727,17 @@
         if (!autoEnabled()) { if (autoJob) cancelAuto(); return }
         // Recover an already-present bootstrap object when auto mode was enabled after page startup.
         if (!autoTrack && unsafeWindow.__playinfo__) observeAutoInfo(unsafeWindow.__playinfo__, '__playinfo__补查')
-        if (!autoTrack || autoJob || autoCompletedKey === autoTrack.key) return
+        if (!autoTrack || autoJob) return
+        const video = document.querySelector('video')
+        if (video && !video.paused && !video.seeking && video.readyState < 3) {
+            if (!autoStallSince) autoStallSince = Date.now()
+            if (Date.now() - autoStallSince >= 8000) autoCompletedKey = ''
+        } else autoStallSince = 0
+        if (autoCompletedKey === autoTrack.key) return
+        if (autoBufferReady()) {
+            autoStatus = '当前播放缓冲充足，暂不额外测速'
+            return
+        }
         void runAuto()
     }, 1000)
     window.addEventListener('pagehide', cancelAuto)
